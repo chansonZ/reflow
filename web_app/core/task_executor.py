@@ -975,6 +975,19 @@ class TaskExecutor:
             x in tool_lower
             for x in ("scrape", "read", "fetch", "browse", "webpage", "url", "crawl", "visit")
         ):
+            # Support multi-URL tools (e.g. scrape_and_extract_info_multi)
+            raw_urls = args.get("urls")
+            if isinstance(raw_urls, list) and raw_urls:
+                url_list = [str(u) for u in raw_urls if u]
+                return {
+                    "id": evt_id,
+                    "type": "read",
+                    "url": url_list[0] if url_list else "",
+                    "urls": url_list,
+                    "parent_id": last_search_id,
+                    "tool_name": tool_name,
+                    "args": args,
+                }
             url = str(
                 args.get("url")
                 or args.get("webpage_url")
