@@ -54,7 +54,7 @@ async def _scrape_and_extract_single(
             "extracted_info": "",
             "error": "You are trying to scrape a Hugging Face dataset for answers, please do not use the scrape tool for this purpose.",
             "scrape_stats": {},
-            "model_used": SUMMARY_LLM_MODEL_NAME,
+            "model_used": "",
             "tokens_used": 0,
         }
 
