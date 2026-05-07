@@ -878,6 +878,7 @@ class TaskExecutor:
 
                 matched_evt = native_pending.get(call_id)
                 if matched_evt:
+                    matched_evt["_resolved"] = True
                     self._apply_result_to_event(matched_evt, raw_content)
                     if matched_evt["type"] == "search":
                         last_completed_type = "search"
@@ -945,6 +946,22 @@ class TaskExecutor:
                 elif mcp_pending:
                     # text_protocol: whole content is the tool result for the first pending call
                     for evt in mcp_pending:
+                        if not evt.get("_resolved"):
+                            evt["_resolved"] = True
+                            self._apply_result_to_event(evt, full_text)
+                            if evt["type"] == "search":
+                                last_completed_type = "search"
+                                last_search_id = evt["id"]
+                            elif evt["type"] == "read":
+                                last_completed_type = "read"
+                                last_read_id = evt["id"]
+                            break
+
+                elif any(not e.get("_resolved") for e in native_pending.values()):
+                    # Hybrid format (e.g. OpenRouter): native tool_calls in assistant message
+                    # but tool results delivered as role=user messages instead of role=tool.
+                    # Apply the text to each unresolved native pending event in order.
+                    for _, evt in list(native_pending.items()):
                         if not evt.get("_resolved"):
                             evt["_resolved"] = True
                             self._apply_result_to_event(evt, full_text)
