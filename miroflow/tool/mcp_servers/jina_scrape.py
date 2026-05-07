@@ -39,6 +39,78 @@ def _get_httpx_client() -> httpx.AsyncClient:
     return _httpx_client
 
 
+async def _scrape_and_extract_single(
+    url: str, info_to_extract: str, custom_headers: Dict[str, str] = None
+) -> Dict[str, Any]:
+    """
+    Internal helper: scrape a single URL and extract information via LLM.
+    Returns a plain dict (not JSON string).
+    """
+    logger.info(f'#z _scrape_and_extract_single url={url}')
+    if _is_huggingface_dataset_or_space_url(url):
+        return {
+            "success": False,
+            "url": url,
+            "extracted_info": "",
+            "error": "You are trying to scrape a Hugging Face dataset for answers, please do not use the scrape tool for this purpose.",
+            "scrape_stats": {},
+            "model_used": SUMMARY_LLM_MODEL_NAME,
+            "tokens_used": 0,
+        }
+
+    # First, scrape the content with Jina
+    scrape_result = await scrape_url_with_jina(url, custom_headers)
+
+    # If Jina fails, try direct Python scraping as fallback
+    if not scrape_result["success"]:
+        logger.warning(
+            f"Jina Scrape and Extract Info: Jina scraping failed: {scrape_result['error']}, trying direct Python scraping as fallback"
+        )
+        scrape_result = await scrape_url_with_python(url, custom_headers)
+
+        if not scrape_result["success"]:
+            logger.error(
+                f"Jina Scrape and Extract Info: Both Jina and Python scraping failed: {scrape_result['error']}"
+            )
+            return {
+                "success": False,
+                "url": url,
+                "extracted_info": "",
+                "error": f"Scraping failed (both Jina and Python): {scrape_result['error']}",
+                "scrape_stats": {},
+                "model_used": SUMMARY_LLM_MODEL_NAME,
+                "tokens_used": 0,
+            }
+        else:
+            logger.info(
+                f"Jina Scrape and Extract Info: Python fallback scraping succeeded for URL: {url}"
+            )
+
+    # Then, summarize the content
+    extracted_result = await extract_info_with_llm(
+        url=url,
+        content=scrape_result["content"],
+        info_to_extract=info_to_extract,
+        model=SUMMARY_LLM_MODEL_NAME,
+        max_tokens=8192,
+    )
+
+    return {
+        "success": extracted_result["success"],
+        "url": url,
+        "extracted_info": extracted_result["extracted_info"],
+        "error": extracted_result["error"],
+        "scrape_stats": {
+            "line_count": scrape_result["line_count"],
+            "char_count": scrape_result["char_count"],
+            "last_char_line": scrape_result["last_char_line"],
+            "all_content_displayed": scrape_result["all_content_displayed"],
+        },
+        "model_used": extracted_result["model_used"],
+        "tokens_used": extracted_result["tokens_used"],
+    }
+
+
 @mcp.tool()
 async def scrape_and_extract_info(
     url: str, info_to_extract: str, custom_headers: Dict[str, str] = None
@@ -63,73 +135,104 @@ async def scrape_and_extract_info(
             - tokens_used (int): Number of tokens used (if available)
     """
     logger.info(f'#z 进入scrape_and_extract_info url={url},info_to_extract={info_to_extract}')
-    if _is_huggingface_dataset_or_space_url(url):
+    result = await _scrape_and_extract_single(url, info_to_extract, custom_headers)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+async def scrape_and_extract_info_multi(
+    urls: list, info_to_extract: str, custom_headers: Dict[str, str] = None
+):
+    """
+    Concurrently scrape content from multiple URLs and extract meaningful information using an LLM.
+    All URLs are fetched in parallel, which reduces total wait time compared to sequential scraping.
+    Use this tool when you have identified several candidate URLs and want to process them together
+    in a single tool call, keeping the ReAct reasoning loop clean.
+
+    Args:
+        urls (list): A list of URLs to scrape. Each URL supports web pages, PDFs, raw text/code
+                     files (e.g., GitHub, Gist), and similar sources.
+        info_to_extract (str): The specific information to extract from each page (usually a question).
+                               The same extraction query is applied to every URL.
+        custom_headers (Dict[str, str]): Optional additional HTTP headers for all scraping requests.
+
+    Returns:
+        JSON string with:
+            - results (list): Per-URL result objects, each containing:
+                - success (bool): Whether this URL was scraped and extracted successfully
+                - url (str): The URL
+                - extracted_info (str): Extracted information (empty string on failure)
+                - error (str): Error message if the URL failed
+                - scrape_stats (Dict): Scraping statistics
+                - model_used (str): Summarization model name
+                - tokens_used (int): LLM tokens consumed
+            - summary (Dict):
+                - total (int): Total number of URLs attempted
+                - succeeded (int): Number of successful extractions
+                - failed (int): Number of failed extractions
+                - succeeded_urls (list): URLs that succeeded
+                - failed_urls (list): URLs that failed
+    """
+    logger.info(f'#z 进入scrape_and_extract_info_multi urls={urls}, info_to_extract={info_to_extract}')
+
+    if not urls:
         return json.dumps(
             {
-                "success": False,
-                "url": url,
-                "extracted_info": "",
-                "error": "You are trying to scrape a Hugging Face dataset for answers, please do not use the scrape tool for this purpose.",
-                "scrape_stats": {},
-                "tokens_used": 0,
+                "results": [],
+                "summary": {
+                    "total": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "succeeded_urls": [],
+                    "failed_urls": [],
+                },
             },
             ensure_ascii=False,
         )
 
-    # First, scrape the content with Jina
-    scrape_result = await scrape_url_with_jina(url, custom_headers)
+    # Launch all URL scraping tasks concurrently
+    tasks = [
+        _scrape_and_extract_single(url, info_to_extract, custom_headers)
+        for url in urls
+    ]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # If Jina fails, try direct Python scraping as fallback
-    if not scrape_result["success"]:
-        logger.warning(
-            f"Jina Scrape and Extract Info: Jina scraping failed: {scrape_result['error']}, trying direct Python scraping as fallback"
-        )
-        scrape_result = await scrape_url_with_python(url, custom_headers)
+    results = []
+    succeeded_urls = []
+    failed_urls = []
 
-        if not scrape_result["success"]:
-            logger.error(
-                f"Jina Scrape and Extract Info: Both Jina and Python scraping failed: {scrape_result['error']}"
-            )
-            return json.dumps(
-                {
-                    "success": False,
-                    "url": url,
-                    "extracted_info": "",
-                    "error": f"Scraping failed (both Jina and Python): {scrape_result['error']}",
-                    "scrape_stats": {},
-                    "tokens_used": 0,
-                },
-                ensure_ascii=False,
-            )
+    for url, raw in zip(urls, raw_results):
+        if isinstance(raw, Exception):
+            # Unexpected exception from gather — treat as failure
+            logger.error(f'#z scrape_and_extract_info_multi: exception for url={url}: {raw}')
+            result = {
+                "success": False,
+                "url": url,
+                "extracted_info": "",
+                "error": f"Unexpected error: {str(raw)}",
+                "scrape_stats": {},
+                "model_used": SUMMARY_LLM_MODEL_NAME,
+                "tokens_used": 0,
+            }
         else:
-            logger.info(
-                f"Jina Scrape and Extract Info: Python fallback scraping succeeded for URL: {url}"
-            )
+            result = raw
 
-    # Then, summarize the content
-    extracted_result = await extract_info_with_llm(
-        url=url,
-        content=scrape_result["content"],
-        info_to_extract=info_to_extract,
-        model=SUMMARY_LLM_MODEL_NAME,
-        max_tokens=8192,
-    )
+        results.append(result)
+        if result.get("success"):
+            succeeded_urls.append(url)
+        else:
+            failed_urls.append(url)
 
-    # Combine results
     return json.dumps(
         {
-            "success": extracted_result["success"],
-            "url": url,
-            "extracted_info": extracted_result["extracted_info"],
-            "error": extracted_result["error"],
-            "scrape_stats": {
-                "line_count": scrape_result["line_count"],
-                "char_count": scrape_result["char_count"],
-                "last_char_line": scrape_result["last_char_line"],
-                "all_content_displayed": scrape_result["all_content_displayed"],
+            "results": results,
+            "summary": {
+                "total": len(urls),
+                "succeeded": len(succeeded_urls),
+                "failed": len(failed_urls),
+                "succeeded_urls": succeeded_urls,
+                "failed_urls": failed_urls,
             },
-            "model_used": extracted_result["model_used"],
-            "tokens_used": extracted_result["tokens_used"],
         },
         ensure_ascii=False,
     )
