@@ -1,0 +1,91 @@
+# MiroFlow Web Demo Configuration
+# A simplified configuration for the web interface (using MiroThinker)
+
+# No benchmark defaults - this is a standalone config
+defaults:
+  - override hydra/job_logging: none
+  - _self_
+
+entrypoint: main_agent
+
+main_agent:
+  name: main_agent
+  type: IterativeAgentWithToolAndRollback
+  max_turns: 1
+  # 新增：Rollback 配置
+  max_consecutive_rollbacks: 3     # ← 原 5，更激进
+  max_duplicate_rollbacks: 2     # ← 原 3
+  verbose: true
+
+  llm:
+    _base_: config/llm/base_mirothinker.yaml
+    provider_class: MiroThinkerVLLMClient
+    model_name: MiroThinker-1.7
+
+  prompt: config/prompts/prompt_main_agent.yaml
+
+  tools:
+    - config/tool/tool-serper-search.yaml
+    - config/tool/tool-jina-scrape.yaml
+    - config/tool/tool-reading.yaml
+    # - config/tool/tool-code-sandbox.yaml # 没有这个环境E2B云端沙箱
+    #- config/tool/tool-code.yaml
+    #- config/tool/tool-image-video.yaml
+    # - config/tool/tool-audio.yaml     # Uncomment for audio processing
+
+  input_processor:
+    - ${input-message-generator}
+
+  # Execution order is designed to guarantee at least one visible output in
+  # the web_app regardless of how the agent finished:
+  #   1. SummaryGenerator      – produces ctx.summary from message_history
+  #   2. FinalAnswerExtractor  – extracts ctx.final_boxed_answer from summary
+  #   3. ExceedMaxTurnSummaryGenerator – A-style fallback (failure post-mortem)
+  #   4. FallbackFinalAnswerGenerator  – B-style fallback (user-friendly summary),
+  #      then A-style if B fails; ensures final_boxed_answer is always non-empty.
+  output_processor:
+    - ${output-summary}
+    - ${output-final-answer-extraction} # 不加入这个也没有正常结果的输出
+    - ${output-exceed-max-turn-summary}
+    - ${output-fallback-final-answer}
+
+# Input processor: generates initial message from task description
+input-message-generator:
+  type: InputMessageGenerator
+
+# Output processor: summarizes conversation
+output-summary:
+  type: SummaryGenerator
+
+# # Output processor: extracts final answer
+output-final-answer-extraction:
+  type: FinalAnswerExtractor
+  prompt: config/prompts/prompt_final_answer_extraction.yaml
+  llm:
+    _base_: config/llm/base_mirothinker.yaml
+    model_name: MiroThinker-1.7
+
+# 下面的不建议用其他模型，因为比如你是谁的问题，会生成当前模型相关的
+# Output processor: fallback summary when exceeded max turns / no valid final answer
+# Implementation is aligned with config/prompts/prompt_main_agent_benchmark.yaml
+# (basic_exceed_max_turn_summary_prompt) and miroflow/io_processor/exceed_max_turn_summary_generator.py
+output-exceed-max-turn-summary:
+  type: ExceedMaxTurnSummaryGenerator
+  prompt: config/prompts/prompt_main_agent.yaml
+  llm:
+    _base_: config/llm/base_mirothinker.yaml
+    model_name: MiroThinker-1.7
+
+# Output processor: ultimate fallback guaranteeing a visible answer in web_app.
+# Tries B-style (user-friendly final-answer summary) first, then A-style
+# (failure post-mortem) as last resort.  Writes result to final_boxed_answer
+# so it maps to Task.final_answer without any additional plumbing changes.
+output-fallback-final-answer:
+  type: FallbackFinalAnswerGenerator
+  prompt: config/prompts/prompt_main_agent.yaml
+  llm:
+    _base_: config/llm/base_mirothinker.yaml
+    model_name: MiroThinker-1.7
+
+# Output directory for logs
+output_dir: logs/gradio_runs/

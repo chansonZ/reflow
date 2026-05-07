@@ -1,0 +1,8 @@
+# Remote MCP tool configuration for tool-jina-scrape
+# Points to an independently running HTTP MCP service.
+# The service is started via docker-compose.mcp.yml or scripts/start_mcp_servers.sh.
+#
+# Environment variable override: TOOL_JINA_SCRAPE_URL (default: http://localhost:8003/mcp)
+name: "tool-jina-scrape"
+url: "${oc.env:TOOL_JINA_SCRAPE_URL,http://localhost:8003/mcp}"
+transport: "streamable-http"

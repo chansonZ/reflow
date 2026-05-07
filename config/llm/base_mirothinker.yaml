@@ -1,0 +1,24 @@
+# config/llm/base.yaml
+provider_class: "MiroThinkerVLLMClient"
+model_name: MiroThinker-1.7
+api_key: ${oc.env:OAI_MIROTHINKER_API_KEY,empty}
+base_url: ${oc.env:OAI_MIROTHINKER_BASE_URL,http://localhost:43219/v1}
+
+temperature: 1.0
+top_p: 0.95
+min_p: 0.0
+top_k: -1
+
+max_tokens: 16384
+max_context_length: 65536
+async_client: true
+
+reasoning_effort: null
+repetition_penalty: 1.05
+
+disable_cache_control: false
+keep_tool_result: -1
+strip_think_from_history: false
+
+use_tool_calls: false
+oai_tool_thinking: false

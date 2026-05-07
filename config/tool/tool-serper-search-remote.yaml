@@ -1,0 +1,8 @@
+# Remote MCP tool configuration for tool-serper-search
+# Points to an independently running HTTP MCP service.
+# The service is started via docker-compose.mcp.yml or scripts/start_mcp_servers.sh.
+#
+# Environment variable override: TOOL_SERPER_SEARCH_URL (default: http://localhost:8001/mcp)
+name: "tool-serper-search"
+url: "${oc.env:TOOL_SERPER_SEARCH_URL,http://localhost:8001/mcp}"
+transport: "streamable-http"

@@ -1,0 +1,8 @@
+# Remote MCP tool configuration for tool-reading
+# Points to an independently running HTTP MCP service.
+# The service is started via docker-compose.mcp.yml or scripts/start_mcp_servers.sh.
+#
+# Environment variable override: TOOL_READING_URL (default: http://localhost:8004/mcp)
+name: "tool-reading"
+url: "${oc.env:TOOL_READING_URL,http://localhost:8004/mcp}"
+transport: "streamable-http"
