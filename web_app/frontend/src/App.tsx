@@ -379,7 +379,7 @@ export default function App() {
                   ))}
                   {statusUpdate?.trajectory && statusUpdate.trajectory.length > 0 && (
                     <div className="space-y-2">
-                      <div className="text-xs text-gray-500">事件流（实时）</div>
+                      <div className="text-xs text-gray-500">Event stream (live)</div>
                       <TrajectoryView events={statusUpdate.trajectory} />
                     </div>
                   )}

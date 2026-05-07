@@ -52,6 +52,8 @@ _NO_ANSWER_PLACEHOLDERS = frozenset(
         "UNKNOWN",
     }
 )
+_MAX_EVENT_RESULT_LENGTH = 3000
+_TRUNCATION_SUFFIX = "\n... (truncated)"
 
 
 def _is_placeholder(s: str) -> bool:
@@ -1019,10 +1021,10 @@ class TaskExecutor:
 
     def _apply_result_to_event(self, evt: dict, result_str: str) -> None:
         """Enrich a trajectory event with tool result data (in-place)."""
-        evt["result"] = result_str[:3000] if result_str else ""
+        evt["result"] = self._truncate_event_payload(result_str)
         if self._is_error_result(result_str):
             evt["status"] = "error"
-            evt["error"] = result_str[:3000]
+            evt["error"] = self._truncate_event_payload(result_str)
             return
 
         evt["status"] = "completed"
@@ -1036,14 +1038,30 @@ class TaskExecutor:
         """Best-effort error detection for tool result payloads."""
         if not result_str:
             return False
+        try:
+            parsed = json.loads(result_str)
+            if isinstance(parsed, dict):
+                if parsed.get("is_error") is True:
+                    return True
+                if isinstance(parsed.get("error"), (str, dict, list)):
+                    return True
+                if isinstance(parsed.get("errors"), list) and parsed["errors"]:
+                    return True
+        except Exception:
+            pass
+
         lowered = result_str.lower()
         return (
-            '"is_error": true' in lowered
-            or '"error":' in lowered
-            or "tool execution failed" in lowered
+            "tool execution failed" in lowered
             or "traceback" in lowered
-            or "exception" in lowered
+            or "uncaught exception" in lowered
         )
+
+    def _truncate_event_payload(self, text: str) -> str:
+        """Truncate event payloads while preserving truncation visibility."""
+        if len(text) <= _MAX_EVENT_RESULT_LENGTH:
+            return text
+        return text[:_MAX_EVENT_RESULT_LENGTH] + _TRUNCATION_SUFFIX
 
     def _parse_search_results(self, result_str: str) -> list[dict]:
         """Parse a JSON search-result string into a list of result dicts."""
