@@ -377,12 +377,14 @@ export default function App() {
                   {messages.filter(msg => msg.role === 'assistant').map((msg, index) => (
                     <MessageBubble key={index} role={msg.role} content={msg.content} isRunning={true} />
                   ))}
-                  {statusUpdate?.trajectory && statusUpdate.trajectory.length > 0 && (
+                  {messages.filter(msg => msg.role === 'assistant').length === 0 &&
+                    statusUpdate?.trajectory &&
+                    statusUpdate.trajectory.length > 0 && (
                     <div className="space-y-2">
                       <div className="text-xs text-gray-500">Event stream (live)</div>
                       <TrajectoryView events={statusUpdate.trajectory} />
                     </div>
-                  )}
+                    )}
                   <div className="flex items-start gap-4">
                     <div className="w-8 h-8 rounded-full bg-blue-500 flex items-center justify-center flex-shrink-0">
                       <Bot className="w-5 h-5 text-white" />
