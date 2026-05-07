@@ -59,6 +59,9 @@ export interface TrajectoryEvent {
   // generic tool_call
   tool_name?: string | null;
   args?: Record<string, unknown> | null;
+  status?: 'started' | 'completed' | 'error' | null;
+  result?: string | null;
+  error?: string | null;
 }
 
 export interface TaskStatusUpdate {

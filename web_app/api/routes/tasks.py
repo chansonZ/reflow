@@ -176,6 +176,7 @@ async def get_task_status(
     stored_trajectory: list = [] #z
 
     if task.status == "running" and task_executor.is_task_running(task_id):
+        progress = task_executor.get_task_progress(task_id)
         progress_messages = progress.get("messages", [])
         progress_trajectory = progress.get("trajectory", [])
 

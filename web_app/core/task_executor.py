@@ -343,11 +343,26 @@ class TaskExecutor:
 
         except Exception as e:
             error_msg = f"{e!s}\n{traceback.format_exc()}"
+            error_data = self._get_all_messages_from_tracer(tracer) if tracer else {
+                "messages": [],
+                "trajectory": [],
+            }
             self.session_manager.update_task(
                 task_id,
                 {
                     "status": "failed",
                     "error_message": error_msg,
+                    "messages": error_data.get("messages", []),
+                    "trajectory": error_data.get("trajectory", [])
+                    + [
+                        {
+                            "id": f"err_{uuid.uuid4().hex[:8]}",
+                            "type": "tool_call",
+                            "tool_name": "agent_execution",
+                            "status": "error",
+                            "error": str(e),
+                        }
+                    ],
                 },
             )
             if tracer:
@@ -969,6 +984,7 @@ class TaskExecutor:
                 "parent_id": None,
                 "tool_name": tool_name,
                 "args": args,
+                "status": "started",
             }
 
         if any(
@@ -989,6 +1005,7 @@ class TaskExecutor:
                 "parent_id": last_search_id,
                 "tool_name": tool_name,
                 "args": args,
+                "status": "started",
             }
 
         return {
@@ -997,15 +1014,36 @@ class TaskExecutor:
             "tool_name": tool_name,
             "args": args,
             "parent_id": last_search_id,
+            "status": "started",
         }
 
     def _apply_result_to_event(self, evt: dict, result_str: str) -> None:
         """Enrich a trajectory event with tool result data (in-place)."""
+        evt["result"] = result_str[:3000] if result_str else ""
+        if self._is_error_result(result_str):
+            evt["status"] = "error"
+            evt["error"] = result_str[:3000]
+            return
+
+        evt["status"] = "completed"
         if evt.get("type") == "search":
             results = self._parse_search_results(result_str)
             if results:
                 evt["results"] = results
                 evt["results_count"] = len(results)
+
+    def _is_error_result(self, result_str: str) -> bool:
+        """Best-effort error detection for tool result payloads."""
+        if not result_str:
+            return False
+        lowered = result_str.lower()
+        return (
+            '"is_error": true' in lowered
+            or '"error":' in lowered
+            or "tool execution failed" in lowered
+            or "traceback" in lowered
+            or "exception" in lowered
+        )
 
     def _parse_search_results(self, result_str: str) -> list[dict]:
         """Parse a JSON search-result string into a list of result dicts."""
