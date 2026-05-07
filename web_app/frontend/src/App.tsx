@@ -374,7 +374,7 @@ export default function App() {
                 <>
                   {/* {messages.filter(msg => msg.role !== 'user').map((msg, index) => (
                      */}
-                  {messages.map((msg, index) => (
+                  {messages.filter(msg => msg.role === 'assistant').map((msg, index) => (
                     <MessageBubble key={index} role={msg.role} content={msg.content} isRunning={true} />
                   ))}
                   {statusUpdate?.trajectory && statusUpdate.trajectory.length > 0 && (

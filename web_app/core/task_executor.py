@@ -443,10 +443,8 @@ class TaskExecutor:
                         current_turn = max(
                             current_turn, (len(message_history) + 1) // 2
                         )
-                        # # Get ALL messages for display (full history)
-                        messages = self._format_messages(message_history)
-                        # 前端不展示系统提示
-                        # messages = self._format_messages_filter(message_history)
+                        # 运行中仅展示清洗后的助手进展消息
+                        messages = self._format_messages_filter(message_history)
                         #z 多agent应该这样吧
                         # message_history.extend(hist)          # 合并所有 agent 的消息
                         # messages.extend(self._format_messages(hist))
@@ -601,8 +599,9 @@ class TaskExecutor:
         """
         
         def _is_system_message(msg: dict) -> bool:
-            # 角色为 system 的消息，直接认为是系统提示
-            if msg.get("role", "").lower() == "system":
+            role = msg.get("role", "").lower()
+            # 运行中界面已单独展示用户问题，不再重复显示 user/system 原始提示
+            if role in {"system", "user"}:
                 return True
 
             content = msg.get("content", "")
@@ -615,6 +614,8 @@ class TaskExecutor:
             # 可扩展的噪声/系统提示模式（短且明确）
             FILTER_PATTERNS = [
                 "Tool-Use Formatting Instructions",
+                "<server_name>server name here</server_name>",
+                "<tool_name>tool name here</tool_name>",
                 # "Tool-Use Formatting",
                 # "You only have access to the tools",
                 # "In this environment you have access",
@@ -671,12 +672,17 @@ class TaskExecutor:
                 content = str(content)
 
             # Don't truncate - preserve full content for thinking and tool results
-            formatted.append(
-                {
-                    "role": role,
-                    "content": content,
-                }
-            )
+            formatted_msg: dict = {
+                "role": role,
+                "content": content,
+            }
+            if role == "assistant":
+                dedicated = msg.get("reasoning") or msg.get("reasoning_content")
+                if dedicated and isinstance(dedicated, str) and dedicated.strip():
+                    formatted_msg["content"] = (
+                        f"<think>{dedicated.strip()}</think>\n{content}"
+                    )
+            formatted.append(formatted_msg)
         # if formatted:
         #     print(f'in: _format_messages_filter:\n{formatted}')
         return formatted
