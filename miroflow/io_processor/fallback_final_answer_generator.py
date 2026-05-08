@@ -74,6 +74,7 @@ _FALLBACK_FINAL_THINK_CONTENT = (
 _FALLBACK_FINAL_ASSISTANT_PREFIX = (
     f"<think>\n{_FALLBACK_FINAL_THINK_CONTENT}\n</think>\n\n"
 )
+_MAX_SNIPPETS_FROM_HISTORY = 12
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -277,7 +278,6 @@ class FallbackFinalAnswerGenerator(BaseIOProcessor):
     def _extract_snippets_from_history(message_history: list) -> str:
         """Extract concise snippets from tool-result-like user payloads."""
         snippets: list[str] = []
-        max_snippets = 12
 
         for msg in message_history:
             if not isinstance(msg, dict) or msg.get("role") != "user":
@@ -295,7 +295,7 @@ class FallbackFinalAnswerGenerator(BaseIOProcessor):
 
                 try:
                     data = json.loads(raw)
-                except Exception:
+                except json.JSONDecodeError:
                     continue
 
                 organic = data.get("organic")
@@ -313,7 +313,7 @@ class FallbackFinalAnswerGenerator(BaseIOProcessor):
                         snippets.append(f"- {title}: {snippet}")
                     else:
                         snippets.append(f"- {title or snippet}")
-                    if len(snippets) >= max_snippets:
+                    if len(snippets) >= _MAX_SNIPPETS_FROM_HISTORY:
                         return "\n".join(snippets)
 
         return "\n".join(snippets)
