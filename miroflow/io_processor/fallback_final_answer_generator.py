@@ -19,6 +19,7 @@ processor tries two strategies in order:
    used by :class:`ExceedMaxTurnSummaryGenerator`.  The result is written to
    both ``ctx.final_boxed_answer`` and ``ctx.summary``.
 """
+import json
 import re
 
 from miroflow.agents.context import AgentContext
@@ -73,6 +74,7 @@ _FALLBACK_FINAL_THINK_CONTENT = (
 _FALLBACK_FINAL_ASSISTANT_PREFIX = (
     f"<think>\n{_FALLBACK_FINAL_THINK_CONTENT}\n</think>\n\n"
 )
+_MAX_SNIPPETS_FROM_HISTORY = 12
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -85,6 +87,9 @@ def _clean_llm_response(text: str) -> str:
         return ""
     # Remove all <think>…</think> blocks
     content = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+    # Remove trailing unclosed <think> block (if model starts a new think section
+    # in continuation without closing tag).
+    content = re.sub(r"<think>[\s\S]*$", "", content, flags=re.IGNORECASE).strip()
     # Remove tool-call blocks (should not appear, but guard anyway)
     content = re.sub(r"<use_mcp_tool>[\s\S]*", "", content).strip()
     # Remove empty \boxed{} patterns
@@ -189,11 +194,132 @@ class FallbackFinalAnswerGenerator(BaseIOProcessor):
 
     @staticmethod
     def _prepare_message_history(ctx: AgentContext) -> list:
-        """Return a copy of message_history with a trailing user message removed."""
-        history = ctx.get("message_history", []).copy()
+        """Return a cleaned copy of message_history for fallback generation."""
+        raw_history = ctx.get("message_history", [])
+        history = []
+
+        for msg in raw_history:
+            if not isinstance(msg, dict):
+                continue
+
+            role = msg.get("role")
+            if role not in {"system", "user", "assistant"}:
+                continue
+
+            content = msg.get("content", "")
+            if role == "assistant":
+                if not FallbackFinalAnswerGenerator._has_body_content(content):
+                    continue
+                text = FallbackFinalAnswerGenerator._content_to_text(content)
+                history.append({"role": role, "content": text})
+                continue
+
+            # Preserve user/system list-typed content (tool-result-like payloads),
+            # but normalize empty/non-text bodies.
+            if isinstance(content, list) and content:
+                history.append({"role": role, "content": content})
+                continue
+
+            text = FallbackFinalAnswerGenerator._content_to_text(content)
+            if text:
+                history.append({"role": role, "content": text})
+
         if history and history[-1].get("role") == "user":
             history.pop()
+
+        if not history:
+            snippets = FallbackFinalAnswerGenerator._extract_snippets_from_history(
+                raw_history
+            )
+            if snippets:
+                history = [{"role": "user", "content": snippets}]
         return history
+
+    @staticmethod
+    def _content_to_text(content) -> str:
+        """Flatten mixed content payloads into plain text."""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, dict):
+            for key in ("text", "content"):
+                value = content.get(key)
+                if isinstance(value, str):
+                    return value.strip()
+            return ""
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    if item.strip():
+                        parts.append(item.strip())
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                text_value = item.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    parts.append(text_value.strip())
+                    continue
+                content_value = item.get("content")
+                if isinstance(content_value, str) and content_value.strip():
+                    parts.append(content_value.strip())
+            return "\n".join(parts).strip()
+        return ""
+
+    @staticmethod
+    def _has_body_content(content) -> bool:
+        """True when content has user-visible body text after stripping tool scaffolding."""
+        text = FallbackFinalAnswerGenerator._content_to_text(content)
+        if not text:
+            return False
+
+        text = re.sub(r"<think>[\s\S]*?</think>", "", text)
+        text = re.sub(r"<use_mcp_tool>[\s\S]*?</use_mcp_tool>", "", text)
+        text = re.sub(r"</?(server_name|tool_name|arguments)>", "", text)
+        return bool(text.strip())
+
+    @staticmethod
+    def _extract_snippets_from_history(message_history: list) -> str:
+        """Extract concise snippets from tool-result-like user payloads."""
+        snippets: list[str] = []
+
+        for msg in message_history:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                raw = item.get("text")
+                if not isinstance(raw, str) or not raw.strip():
+                    continue
+
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                organic = data.get("organic")
+                if not isinstance(organic, list):
+                    continue
+
+                for result in organic:
+                    if not isinstance(result, dict):
+                        continue
+                    title = (result.get("title") or "").strip()
+                    snippet = (result.get("snippet") or "").strip()
+                    if not title and not snippet:
+                        continue
+                    if title and snippet:
+                        snippets.append(f"- {title}: {snippet}")
+                    else:
+                        snippets.append(f"- {title or snippet}")
+                    if len(snippets) >= _MAX_SNIPPETS_FROM_HISTORY:
+                        return "\n".join(snippets)
+
+        return "\n".join(snippets)
 
     async def _try_b_style(
         self, message_history: list, task_description: str
