@@ -87,6 +87,9 @@ def _clean_llm_response(text: str) -> str:
         return ""
     # Remove all <think>…</think> blocks
     content = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+    # Remove trailing unclosed <think> block (if model starts a new think section
+    # in continuation without closing tag).
+    content = re.sub(r"<think>[\s\S]*$", "", content, flags=re.IGNORECASE).strip()
     # Remove tool-call blocks (should not appear, but guard anyway)
     content = re.sub(r"<use_mcp_tool>[\s\S]*", "", content).strip()
     # Remove empty \boxed{} patterns
