@@ -5,18 +5,20 @@
 """
 Exceed Max Turn Summary Generator.
 
-Generates summaries when task exceeds max turns without valid box.
+Generates retry-oriented summaries only when the agent actually failed due to
+turn/context limits and no valid boxed answer exists.
 """
 
 import re
 
 from miroflow.agents.context import AgentContext
+from miroflow.benchmark.eval_utils import is_valid_box
 from miroflow.io_processor.base import BaseIOProcessor
 from miroflow.registry import ComponentType, register
-from miroflow.benchmark.eval_utils import is_valid_box
 from miroflow.llm.base import ContextLimitError
 
-from miroflow.logging.task_tracer import get_tracer #z
+from miroflow.logging.task_tracer import get_tracer
+
 logger = get_tracer()
 # Assistant prefix for failure summary generation (aligned with MiroThinker)
 # This guides the model to think first and then output structured content
@@ -35,91 +37,90 @@ FAILURE_SUMMARY_ASSISTANT_PREFIX = (
 
 @register(ComponentType.IO_PROCESSOR, "ExceedMaxTurnSummaryGenerator")
 class ExceedMaxTurnSummaryGenerator(BaseIOProcessor):
-    """Generates summaries for retry logic when task exceeds max turns without valid box.
-
-    Uses assistant prefill mechanism aligned with MiroThinker to ensure structured output.
-    """
+    """Generates retry summaries when the task exceeded max turns/context limits."""
 
     USE_PROPAGATE_MODULE_CONFIGS = ("llm", "prompt")
 
     @staticmethod
+    def _should_generate_exceed_summary(ctx: AgentContext) -> bool:
+        """Generate only for retry-relevant failure states without a valid final answer."""
+        final_boxed_answer = ctx.get("final_boxed_answer", "")
+        if is_valid_box(final_boxed_answer):
+            return False
+
+        return bool(ctx.get("reached_limit", False))
+
+    @staticmethod
     def _extract_failure_experience_summary(text: str) -> str:
-        """Extract failure experience summary from LLM response text.
-
-        The text may contain:
-        - Multiple <think>...</think> blocks (all removed from final output)
-        - Main content after removing all think blocks
-        - <use_mcp_tool>...</use_mcp_tool> block (tool call, ignored)
-        - Empty \\boxed{} patterns (ignored)
-
-        Returns:
-            - Content with all <think> blocks removed
-            - If content is empty after filtering, return last think_content as fallback
-            - Any <use_mcp_tool> block is always removed
-        """
+        """Extract failure experience summary from LLM response text."""
         if not text:
             return ""
 
-        # Extract all think contents (for fallback)
         think_matches = list(re.finditer(r"<think>([\s\S]*?)</think>", text))
         last_think_content = ""
         if think_matches:
             last_think_content = think_matches[-1].group(1).strip()
 
-        # Remove ALL <think>...</think> blocks from content
         content = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
-
-        # Remove <use_mcp_tool>...</use_mcp_tool> block from content
         content = re.sub(r"<use_mcp_tool>[\s\S]*", "", content).strip()
-
-        # Remove empty \boxed{} patterns (common pollution in model output)
         content = re.sub(r"\\boxed\{\s*\}", "", content).strip()
 
         return content if content else last_think_content
 
+    @staticmethod
+    def _fallback_exceed_summary(ctx: AgentContext) -> str:
+        """Build a lightweight retry summary without another LLM call."""
+        summary = (ctx.get("summary", "") or "").strip()
+        if summary:
+            return (
+                "Failure type: incomplete\n"
+                "What happened: The agent hit a turn or context limit before producing a valid final answer.\n"
+                f"Useful findings: {summary[:800]}"
+            )
+
+        return (
+            "Failure type: incomplete\n"
+            "What happened: The agent hit a turn or context limit before producing a valid final answer.\n"
+            "Useful findings: No reusable findings were extracted before the run stopped."
+        )
+
     async def run_internal(self, ctx: AgentContext) -> AgentContext:
-        final_boxed_answer = ctx.get("final_boxed_answer", "")
-        if is_valid_box(final_boxed_answer):
+        if not self._should_generate_exceed_summary(ctx):
             return AgentContext(exceed_max_turn_summary=None)
 
-        # Render the simplified prompt (no variables needed, context is in message_history)
         prompt = self.prompt_manager.render_prompt(
             "exceed_max_turn_summary_prompt", context={}
         )
 
-        # Build message history for failure summary generation
         message_history = ctx.get("message_history", []).copy()
-
-        # If last message is from user, remove it (aligned with MiroThinker)
         if message_history and message_history[-1].get("role") == "user":
             message_history.pop()
 
-        # Append user prompt
         message_history.append(
             {"role": "user", "content": [{"type": "text", "text": prompt}]}
         )
-
-        # Append assistant prefix (prefill mechanism - key for structured output)
         message_history.append(
             {"role": "assistant", "content": FAILURE_SUMMARY_ASSISTANT_PREFIX}
         )
 
-        # Call LLM - it will continue from the assistant prefix
         try:
             llm_response = await self.llm_client.create_message(
                 message_history=message_history
             )
-            logger.debug(f'#z ExceedMaxTurnSummaryGenerator llm_response = {llm_response}')
+            logger.debug("ExceedMaxTurnSummaryGenerator llm_response received")
         except ContextLimitError:
+            logger.warning(
+                "Context limit exceeded while generating exceed_max_turn_summary; using fallback summary"
+            )
             return AgentContext(
-                exceed_max_turn_summary="Task interrupted due to context limit."
+                exceed_max_turn_summary=self._fallback_exceed_summary(ctx)
             )
 
-        # Post-process: prepend prefix to response and extract content
         if llm_response.response_text:
             full_text = FAILURE_SUMMARY_ASSISTANT_PREFIX + llm_response.response_text
             summary = self._extract_failure_experience_summary(full_text)
-            print(f'in ExceedMaxTurnSummaryGenerator summary: 【{summary}】\n') #z 没有看到
             return AgentContext(exceed_max_turn_summary=summary)
 
-        return AgentContext(exceed_max_turn_summary=None)
+        return AgentContext(
+            exceed_max_turn_summary=self._fallback_exceed_summary(ctx)
+        )
