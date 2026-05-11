@@ -35,6 +35,7 @@ class TrajectoryEvent(BaseModel):
 
     # read
     url: str | None = None
+    urls: list[str] | None = None  # for multi-URL read events (e.g. scrape_and_extract_info_multi)
 
     # reasoning
     text: str | None = None

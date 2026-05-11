@@ -119,6 +119,12 @@ template:
       4. Avoid broad, vague, or speculative queries. Every tool call should aim to retrieve new, actionable information that clearly advances the task.
       5. **For historical or time-specific content**: Regular search engines return current webpage content, not historical content. Archived webpage search is essential for retrieving content as it appeared in the past, use related tools to search for the historical content.
       6. Even if a tool result does not directly answer the question, thoroughly extract and summarize all partial information, important details, patterns, constraints, or keywords that may help guide future steps. Never proceed to the next step without first ensuring that all significant insights from the current result have been fully considered.
+      7. **Search results are only snippets — always scrape before concluding**: After obtaining search results, you **must** use `scrape_and_extract_info` (or `scrape_and_extract_info_multi` for multiple URLs) to read the full content of the most relevant pages. Search snippets are too brief and incomplete to be used as the sole basis for an answer. Do not present a final answer that relies only on search snippets; always access the full page content first.
+      8. **Batch scraping — MANDATORY rule**: When you have **2 or more candidate URLs** and the extraction target (the question or information you want from each page) is **the same for all of them**, you **MUST** use `scrape_and_extract_info_multi` in a single tool call instead of calling `scrape_and_extract_info` once per URL. Repeatedly calling `scrape_and_extract_info` one URL at a time for the same extraction goal is strictly prohibited.
+         - Trigger conditions (both must hold): (a) you already have ≥ 2 URLs, (b) the `info_to_extract` query is identical or equivalent for every URL.
+         - Parameters: `urls` is a JSON list of all candidate URLs; `info_to_extract` is the single shared extraction instruction applied to every URL.
+         - Exception: if each URL requires a **different** extraction query, fall back to individual `scrape_and_extract_info` calls, one per message.
+         - Note: `scrape_and_extract_info_multi` is itself **one tool call** — it processes all URLs concurrently inside the tool. Using it fully complies with the "one tool call per message" rule above.
 
       ## Tool-Use Communication Rules
 

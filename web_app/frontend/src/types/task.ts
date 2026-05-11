@@ -54,6 +54,7 @@ export interface TrajectoryEvent {
   results_count?: number;
   // read
   url?: string | null;
+  urls?: string[] | null;  // for multi-URL read events
   // reasoning
   text?: string | null;
   // generic tool_call

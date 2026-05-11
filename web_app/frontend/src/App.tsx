@@ -711,21 +711,44 @@ function ReasoningNode({ event }: { event: TrajectoryEvent }) {
 
 function ReadNode({ event, childEvents }: { event: TrajectoryEvent; childEvents: TrajectoryEvent[] }) {
   const url = event.url || '';
+  const urls = event.urls;
+  const isMulti = urls && urls.length > 1;
   const childReasonings = childEvents.filter(e => e.type === 'reasoning');
   return (
     <div className="pl-4 border-l-2 border-green-200 space-y-2">
       <div className="flex items-start gap-2">
         <Globe className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
         <div className="flex-1 min-w-0">
-          <span className="text-sm text-gray-600">浏览网页 </span>
-          <a
-            href={url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-sm text-blue-600 hover:underline break-all"
-          >
-            "{url}"
-          </a>
+          {isMulti ? (
+            <>
+              <span className="text-sm text-gray-600">同时浏览 {urls!.length} 个网页</span>
+              <div className="mt-1 flex flex-col gap-1">
+                {urls!.map((u, i) => (
+                  <a
+                    key={i}
+                    href={u}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-sm text-blue-600 hover:underline truncate block"
+                  >
+                    {u}
+                  </a>
+                ))}
+              </div>
+            </>
+          ) : (
+            <>
+              <span className="text-sm text-gray-600">浏览网页 </span>
+              <a
+                href={url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-sm text-blue-600 hover:underline break-all"
+              >
+                "{url}"
+              </a>
+            </>
+          )}
         </div>
       </div>
       {childReasonings.map(r => (
@@ -1104,7 +1127,7 @@ function ToolCallDisplay({ tool }: { tool: { name: string; args: string; result?
   const [isExpanded, setIsExpanded] = useState(false);
 
   // Parse tool info to create user-friendly display
-  const getToolDisplay = (): { icon: React.ReactNode; action: string; detail: string; type: string } => {
+  const getToolDisplay = (): { icon: React.ReactNode; action: string; detail: string; type: string; urls?: string[] } => {
     const toolName = tool.name.toLowerCase();
     let args: Record<string, unknown> = {};
     try {
@@ -1126,6 +1149,16 @@ function ToolCallDisplay({ tool }: { tool: { name: string; args: string; result?
 
     // Read/scrape webpage tool
     if (toolName.includes('scrape') || toolName.includes('read') || toolName.includes('fetch') || toolName.includes('browse')) {
+      const urlsArg = args.urls;
+      if (Array.isArray(urlsArg) && urlsArg.length > 1) {
+        return {
+          icon: <Globe className="w-4 h-4 text-green-500" />,
+          action: `同时浏览 ${urlsArg.length} 个网页`,
+          detail: '',
+          type: 'read_multi',
+          urls: urlsArg as string[],
+        };
+      }
       const url = args.url || args.webpage_url || args.link || '';
       return {
         icon: <Globe className="w-4 h-4 text-green-500" />,
@@ -1215,6 +1248,36 @@ function ToolCallDisplay({ tool }: { tool: { name: string; args: string; result?
         </div>
       </div>
 
+      {/* Multi-URL list for read_multi tools */}
+      {display.type === 'read_multi' && display.urls && (
+        <div className="ml-6 flex flex-col gap-1">
+          {display.urls.map((u, i) => {
+            let faviconUrl = '';
+            try {
+              const domain = new URL(u).hostname;
+              faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=32`;
+            } catch { /* ignore */ }
+            return (
+              <a
+                key={i}
+                href={u}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex max-w-full items-center gap-2 rounded-[16px] bg-gray-100 px-2 py-1 text-sm text-gray-500 hover:bg-gray-200 transition-colors"
+                title={u}
+              >
+                {faviconUrl ? (
+                  <img src={faviconUrl} alt="" className="h-4 w-4 rounded-full bg-slate-100 shadow flex-shrink-0" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
+                ) : (
+                  <Globe className="h-4 w-4 text-gray-400 flex-shrink-0" />
+                )}
+                <span className="truncate flex-1">{u}</span>
+              </a>
+            );
+          })}
+        </div>
+      )}
+
       {/* Search results display - pill/chip style */}
       {searchResults && (
         <div className="space-y-3">
@@ -1260,7 +1323,7 @@ function ToolCallDisplay({ tool }: { tool: { name: string; args: string; result?
       )}
 
       {/* Expandable details for non-search, non-read tools with results */}
-      {!searchResults && display.type !== 'read' && tool.result && (
+      {!searchResults && display.type !== 'read' && display.type !== 'read_multi' && tool.result && (
         <div className="ml-6">
           <button
             onClick={() => setIsExpanded(!isExpanded)}
@@ -1327,6 +1390,10 @@ function LogItem({ log }: { log: Record<string, unknown> }) {
       return { icon: <Search className="w-4 h-4 text-blue-500" />, text: `Searching for "${query}"` };
     }
     if (name.includes('scrape') || name.includes('read') || name.includes('fetch')) {
+      const urlsArg = args.urls;
+      if (Array.isArray(urlsArg) && urlsArg.length > 1) {
+        return { icon: <Globe className="w-4 h-4 text-green-500" />, text: `同时浏览 ${urlsArg.length} 个网页` };
+      }
       const url = args.url || args.webpage_url || '';
       return { icon: <Globe className="w-4 h-4 text-green-500" />, text: `Reading ${url}` };
     }

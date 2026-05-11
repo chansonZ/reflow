@@ -11,7 +11,7 @@ entrypoint: main_agent
 main_agent:
   name: main_agent
   type: IterativeAgentWithToolAndRollback
-  max_turns: 1
+  max_turns: 4
   # 新增：Rollback 配置
   max_consecutive_rollbacks: 3     # ← 原 5，更激进
   max_duplicate_rollbacks: 2     # ← 原 3

@@ -7,7 +7,7 @@ Fallback Final Answer Generator.
 
 Ensures a visible, user-readable output is always produced in web_app contexts.
 When no valid final answer exists after the regular output-processor chain, this
-processor tries two strategies in order:
+processor tries fallback strategies in order:
 
 1. **B-style (preferred)**: asks the LLM to write a user-friendly final-answer
    summary based on the full conversation history. The result is written to
@@ -19,6 +19,7 @@ processor tries two strategies in order:
    used by :class:`ExceedMaxTurnSummaryGenerator`. The result is written as a
    display fallback without overwriting the normal ``summary`` field.
 """
+import json
 import re
 
 from miroflow.agents.context import AgentContext
@@ -68,6 +69,15 @@ _FALLBACK_FINAL_ASSISTANT_PREFIX = (
     f"<think>\n{_FALLBACK_FINAL_THINK_CONTENT}\n</think>\n\n"
 )
 
+_SNIPPET_STYLE_THINK_CONTENT = (
+    "There is no full-page body content available. "
+    "Use only the provided search snippets to produce the most helpful final answer "
+    "without calling any tools."
+)
+
+_SNIPPET_STYLE_ASSISTANT_PREFIX = (
+    f"<think>\n{_SNIPPET_STYLE_THINK_CONTENT}\n</think>\n\n"
+)
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -91,6 +101,15 @@ def _clean_llm_response(text: str) -> str:
 
 @register(ComponentType.IO_PROCESSOR, "FallbackFinalAnswerGenerator")
 class FallbackFinalAnswerGenerator(BaseIOProcessor):
+    """Fallback output processor: guarantees at least one visible output.
+
+    Execution order in ``agent_web_demo.yaml``:
+      SummaryGenerator → FinalAnswerExtractor → ExceedMaxTurnSummaryGenerator
+      → **FallbackFinalAnswerGenerator**  ← this class
+
+    The processor is a no-op when a valid answer already exists.  Otherwise it
+    tries B-style, then conditional snippet-style, then A-style fallback.
+    """
     """Fallback output processor for web display contexts."""
 
     USE_PROPAGATE_MODULE_CONFIGS = ("llm", "prompt")
@@ -126,6 +145,30 @@ class FallbackFinalAnswerGenerator(BaseIOProcessor):
                 final_boxed_answer=b_result,
                 llm_extracted_final_answer=b_result,
             )
+        logger.info("FallbackFinalAnswerGenerator: B-style fallback returned empty")
+
+        # ── Snippet-style: fallback only when no page body content ─────
+        has_body = self._has_body_content(message_history)
+        if not has_body:
+            snippets = self._extract_snippets_from_history(message_history)
+            if snippets:
+                s_result = await self._try_snippet_style(
+                    snippets=snippets, task_description=task_description
+                )
+                if s_result:
+                    logger.info(
+                        f"FallbackFinalAnswerGenerator: snippet-style fallback succeeded, result={s_result[:120]}"
+                    )
+                    return AgentContext(
+                        final_boxed_answer=s_result,
+                        llm_extracted_final_answer=s_result,
+                    )
+            logger.info(
+                "FallbackFinalAnswerGenerator: no body content detected, snippet-style fallback unavailable or empty"
+            )
+
+        logger.info("FallbackFinalAnswerGenerator: trying A-style")
+        # ── A-style: structured failure post-mortem ───────────────────
 
         logger.info("FallbackFinalAnswerGenerator: B-style fallback returned empty — trying A-style")
         a_result = await self._try_a_style(message_history.copy())
@@ -157,6 +200,81 @@ class FallbackFinalAnswerGenerator(BaseIOProcessor):
             history.pop()
         return history
 
+    @staticmethod
+    def _extract_snippets_from_history(message_history: list) -> list[dict]:
+        """Extract search snippets from message history."""
+        snippets = []
+        seen = set()
+
+        def _append_snippet(title: str, snippet: str, link: str = "") -> None:
+            title = (title or "").strip()
+            snippet = (snippet or "").strip()
+            link = (link or "").strip()
+            if not (title or snippet):
+                return
+            key = (title, snippet, link)
+            if key in seen:
+                return
+            seen.add(key)
+            snippets.append({"title": title, "snippet": snippet, "link": link})
+
+        for msg in message_history:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "text":
+                    continue
+                text = item.get("text", "")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                try:
+                    data = json.loads(text)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                organic = data.get("organic", [])
+                if not isinstance(organic, list):
+                    continue
+                for result in organic:
+                    if not isinstance(result, dict):
+                        continue
+                    _append_snippet(
+                        title=result.get("title", ""),
+                        snippet=result.get("snippet", ""),
+                        link=result.get("link", ""),
+                    )
+        return snippets
+
+    @staticmethod
+    def _has_body_content(message_history: list) -> bool:
+        """Return True when history already contains meaningful page body content."""
+        for msg in message_history:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "text":
+                    continue
+                text = item.get("text", "")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                try:
+                    data = json.loads(text)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                body = data.get("content", "")
+                if isinstance(body, str) and len(body.strip()) >= 200:
+                    return True
+        return False
+
     async def _try_b_style(
         self, message_history: list, task_description: str
     ) -> str | None:
@@ -185,6 +303,54 @@ class FallbackFinalAnswerGenerator(BaseIOProcessor):
 
         if llm_response.response_text:
             full = _FALLBACK_FINAL_ASSISTANT_PREFIX + llm_response.response_text
+            return _clean_llm_response(full) or None
+
+        return None
+
+    async def _try_snippet_style(
+        self, snippets: list[dict], task_description: str
+    ) -> str | None:
+        """Fallback answer generation using only extracted snippets."""
+        if not snippets:
+            return None
+
+        snippet_lines = []
+        for i, item in enumerate(snippets[:20], 1):
+            title = (item.get("title") or "").strip()
+            snippet = (item.get("snippet") or "").strip()
+            link = (item.get("link") or "").strip()
+            parts = [p for p in [title, snippet, link] if p]
+            if parts:
+                snippet_lines.append(f"{i}. " + " | ".join(parts))
+
+        if not snippet_lines:
+            return None
+
+        prompt = (
+            "There is no full webpage body content available in this conversation.\n"
+            "Please produce the best possible final answer using only the snippets below.\n\n"
+            f"Original task:\n{task_description}\n\n"
+            "Available snippets:\n"
+            f"{chr(10).join(snippet_lines)}\n\n"
+            "Requirements:\n"
+            "- Do NOT call any tools.\n"
+            "- Be explicit about uncertainty when snippets are insufficient.\n"
+            "- Output clear, user-readable Markdown."
+        )
+        message_history = [
+            {"role": "user", "content": [{"type": "text", "text": prompt}]},
+            {"role": "assistant", "content": _SNIPPET_STYLE_ASSISTANT_PREFIX},
+        ]
+
+        try:
+            llm_response = await self.llm_client.create_message(
+                message_history=message_history
+            )
+        except ContextLimitError:
+            return None
+
+        if llm_response.response_text:
+            full = _SNIPPET_STYLE_ASSISTANT_PREFIX + llm_response.response_text
             return _clean_llm_response(full) or None
 
         return None

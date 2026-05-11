@@ -3,10 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import time
+from pathlib import Path
 from typing import Any, Dict
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastmcp import FastMCP
@@ -31,12 +35,330 @@ mcp = FastMCP("tool-jina-scrape")
 # Module-level shared httpx client for connection pooling
 _httpx_client: httpx.AsyncClient | None = None
 
+# In-process cache for scrape/reachability state
+_scrape_cache: dict[str, dict[str, Any]] = {}
+_reachability_cache: dict[str, dict[str, Any]] = {}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+SCRAPE_CACHE_ENABLED = _env_bool("SCRAPE_CACHE_ENABLED", True)
+SCRAPE_CACHE_TTL_SECONDS = int(os.getenv("SCRAPE_CACHE_TTL_SECONDS", "1800"))
+SCRAPE_CACHE_DIR = Path(
+    os.getenv(
+        "SCRAPE_CACHE_DIR",
+        str(Path(os.getenv("TASK_LOG_DIR", "./logs/mcp_servers")) / "scrape_cache"),
+    )
+)
+REACHABILITY_CHECK_ENABLED = _env_bool("REACHABILITY_CHECK_ENABLED", True)
+REACHABILITY_TIMEOUT_SECONDS = float(os.getenv("REACHABILITY_TIMEOUT_SECONDS", "3.0"))
+REACHABILITY_CACHE_TTL_SECONDS = int(os.getenv("REACHABILITY_CACHE_TTL_SECONDS", "300"))
+
 def _get_httpx_client() -> httpx.AsyncClient:
     """Get or create a shared httpx.AsyncClient for Serper API requests."""
     global _httpx_client
     if _httpx_client is None or _httpx_client.is_closed:
         _httpx_client = httpx.AsyncClient(timeout=60.0)
     return _httpx_client
+
+
+def _normalize_url_for_cache(url: str) -> str:
+    if not url:
+        return ""
+    raw_url = url.strip()
+    if not raw_url:
+        return ""
+    if not raw_url.lower().startswith(("http://", "https://")):
+        return raw_url
+    parts = urlsplit(raw_url)
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    path = parts.path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+    query_pairs = parse_qsl(parts.query, keep_blank_values=True)
+    query_pairs.sort()
+    query = urlencode(query_pairs, doseq=True)
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def _stable_headers_for_key(custom_headers: Dict[str, str] | None) -> str:
+    if not custom_headers:
+        return ""
+    pairs = []
+    for key, value in custom_headers.items():
+        if key.lower() == "authorization":
+            continue
+        pairs.append((key.lower(), str(value)))
+    pairs.sort()
+    return json.dumps(pairs, ensure_ascii=False, separators=(",", ":"))
+
+
+def _build_scrape_cache_key(
+    url: str, custom_headers: Dict[str, str] | None, max_chars: int = 102400 * 4
+) -> str:
+    normalized_url = _normalize_url_for_cache(url)
+    payload = f"{normalized_url}|{_stable_headers_for_key(custom_headers)}|{max_chars}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _read_file_cache(cache_key: str) -> Dict[str, Any] | None:
+    if not SCRAPE_CACHE_ENABLED:
+        return None
+    cache_path = SCRAPE_CACHE_DIR / f"{cache_key}.json"
+    if not cache_path.exists():
+        return None
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    expires_at = cached.get("expires_at", 0)
+    if expires_at <= time.time():
+        return None
+    result = cached.get("result")
+    return result if isinstance(result, dict) else None
+
+
+def _write_file_cache(cache_key: str, result: Dict[str, Any]) -> None:
+    if not SCRAPE_CACHE_ENABLED:
+        return
+    try:
+        SCRAPE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_path = SCRAPE_CACHE_DIR / f"{cache_key}.json"
+        cache_path.write_text(
+            json.dumps(
+                {
+                    "expires_at": time.time() + SCRAPE_CACHE_TTL_SECONDS,
+                    "result": result,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning(f"Scrape cache write failed: {e}")
+
+
+def _get_scrape_cache(cache_key: str) -> Dict[str, Any] | None:
+    if not SCRAPE_CACHE_ENABLED:
+        return None
+    now = time.time()
+    in_mem = _scrape_cache.get(cache_key)
+    if in_mem and in_mem.get("expires_at", 0) > now:
+        return in_mem.get("result")
+    file_hit = _read_file_cache(cache_key)
+    if file_hit is not None:
+        _scrape_cache[cache_key] = {
+            "expires_at": now + min(SCRAPE_CACHE_TTL_SECONDS, 120),
+            "result": file_hit,
+        }
+        return file_hit
+    return None
+
+
+def _set_scrape_cache(cache_key: str, result: Dict[str, Any]) -> None:
+    if not SCRAPE_CACHE_ENABLED:
+        return
+    if not result.get("success"):
+        return
+    _scrape_cache[cache_key] = {
+        "expires_at": time.time() + SCRAPE_CACHE_TTL_SECONDS,
+        "result": result,
+    }
+    _write_file_cache(cache_key, result)
+
+
+async def _precheck_url_reachability(
+    url: str, custom_headers: Dict[str, str] | None = None
+) -> tuple[bool, str]:
+    if not REACHABILITY_CHECK_ENABLED:
+        return True, ""
+    normalized_url = _normalize_url_for_cache(url)
+    if not normalized_url.lower().startswith(("http://", "https://")):
+        return True, ""
+
+    now = time.time()
+    cached = _reachability_cache.get(normalized_url)
+    if cached and cached.get("expires_at", 0) > now:
+        return bool(cached.get("reachable")), str(cached.get("error", ""))
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; miroflow-reachability-check/1.0)"
+    }
+    if custom_headers:
+        headers.update(custom_headers)
+
+    client = _get_httpx_client()
+    timeout = httpx.Timeout(
+        REACHABILITY_TIMEOUT_SECONDS,
+        connect=min(REACHABILITY_TIMEOUT_SECONDS, 2.0),
+        read=REACHABILITY_TIMEOUT_SECONDS,
+    )
+    try:
+        response = await client.head(
+            normalized_url,
+            headers=headers,
+            timeout=timeout,
+            follow_redirects=True,
+        )
+        if response.status_code in {405, 501}:
+            response = await client.get(
+                normalized_url,
+                headers=headers,
+                timeout=timeout,
+                follow_redirects=True,
+            )
+        reachable = True
+        error = ""
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+        reachable = False
+        error = f"reachability precheck failed: {str(e)}"
+    except Exception:
+        # Unknown precheck errors should not block scraping.
+        reachable = True
+        error = ""
+
+    _reachability_cache[normalized_url] = {
+        "reachable": reachable,
+        "error": error,
+        "expires_at": now + REACHABILITY_CACHE_TTL_SECONDS,
+    }
+    return reachable, error
+
+
+async def _scrape_url_fastest(
+    url: str, custom_headers: Dict[str, str] | None = None
+) -> Dict[str, Any]:
+    cache_key = _build_scrape_cache_key(url, custom_headers)
+    cached_result = _get_scrape_cache(cache_key)
+    if cached_result is not None:
+        logger.info(f"Scrape cache hit for url={url}")
+        return cached_result
+
+    tasks = {
+        "jina": asyncio.create_task(scrape_url_with_jina(url, custom_headers)),
+        "python": asyncio.create_task(scrape_url_with_python(url, custom_headers)),
+    }
+    task_name_by_obj = {task: name for name, task in tasks.items()}
+    pending = set(tasks.values())
+    failures: list[str] = []
+
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                source = task_name_by_obj.get(task, "unknown")
+                try:
+                    result = task.result()
+                except Exception as e:
+                    failures.append(f"{source}: {str(e)}")
+                    continue
+
+                if result.get("success"):
+                    logger.info(f"Scrape race winner: {source}, url={url}")
+                    for wait_task in pending:
+                        wait_task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    _set_scrape_cache(cache_key, result)
+                    return result
+
+                failures.append(f"{source}: {result.get('error', 'unknown error')}")
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    return {
+        "success": False,
+        "content": "",
+        "error": "Scraping failed (race mode): " + " | ".join(failures),
+        "line_count": 0,
+        "char_count": 0,
+        "last_char_line": 0,
+        "all_content_displayed": False,
+    }
+
+
+async def _scrape_and_extract_single(
+    url: str, info_to_extract: str, custom_headers: Dict[str, str] = None
+) -> Dict[str, Any]:
+    """
+    Internal helper: scrape a single URL and extract information via LLM.
+    Returns a plain dict (not JSON string).
+    """
+    logger.info(f'#z _scrape_and_extract_single url={url}')
+    if _is_huggingface_dataset_or_space_url(url):
+        return {
+            "success": False,
+            "url": url,
+            "extracted_info": "",
+            "error": "You are trying to scrape a Hugging Face dataset for answers, please do not use the scrape tool for this purpose.",
+            "scrape_stats": {},
+            "model_used": "",
+            "tokens_used": 0,
+        }
+
+    reachable, reachability_error = await _precheck_url_reachability(url, custom_headers)
+    if not reachable:
+        logger.warning(f"URL unreachable, skip scraping: url={url}, reason={reachability_error}")
+        return {
+            "success": False,
+            "url": url,
+            "extracted_info": "",
+            "error": f"URL unreachable, skipped quickly: {reachability_error}",
+            "scrape_stats": {},
+            "model_used": SUMMARY_LLM_MODEL_NAME,
+            "tokens_used": 0,
+        }
+
+    # Race Jina and Python in parallel, use the first successful result.
+    scrape_result = await _scrape_url_fastest(url, custom_headers)
+    if not scrape_result["success"]:
+        logger.error(
+            f"Jina Scrape and Extract Info: race scraping failed: {scrape_result['error']}"
+        )
+        return {
+            "success": False,
+            "url": url,
+            "extracted_info": "",
+            "error": scrape_result["error"],
+            "scrape_stats": {},
+            "model_used": SUMMARY_LLM_MODEL_NAME,
+            "tokens_used": 0,
+        }
+
+    # Then, summarize the content
+    extracted_result = await extract_info_with_llm(
+        url=url,
+        content=scrape_result["content"],
+        info_to_extract=info_to_extract,
+        model=SUMMARY_LLM_MODEL_NAME,
+        max_tokens=8192,
+    )
+
+    return {
+        "success": extracted_result["success"],
+        "url": url,
+        "extracted_info": extracted_result["extracted_info"],
+        "error": extracted_result["error"],
+        "scrape_stats": {
+            "line_count": scrape_result["line_count"],
+            "char_count": scrape_result["char_count"],
+            "last_char_line": scrape_result["last_char_line"],
+            "all_content_displayed": scrape_result["all_content_displayed"],
+        },
+        "model_used": extracted_result["model_used"],
+        "tokens_used": extracted_result["tokens_used"],
+    }
 
 
 @mcp.tool()
@@ -63,73 +385,104 @@ async def scrape_and_extract_info(
             - tokens_used (int): Number of tokens used (if available)
     """
     logger.info(f'#z 进入scrape_and_extract_info url={url},info_to_extract={info_to_extract}')
-    if _is_huggingface_dataset_or_space_url(url):
+    result = await _scrape_and_extract_single(url, info_to_extract, custom_headers)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+async def scrape_and_extract_info_multi(
+    urls: list, info_to_extract: str, custom_headers: Dict[str, str] = None
+):
+    """
+    Concurrently scrape content from multiple URLs and extract meaningful information using an LLM.
+    All URLs are fetched in parallel, which reduces total wait time compared to sequential scraping.
+    Use this tool when you have identified several candidate URLs and want to process them together
+    in a single tool call, keeping the ReAct reasoning loop clean.
+
+    Args:
+        urls (list): A list of URLs to scrape. Each URL supports web pages, PDFs, raw text/code
+                     files (e.g., GitHub, Gist), and similar sources.
+        info_to_extract (str): The specific information to extract from each page (usually a question).
+                               The same extraction query is applied to every URL.
+        custom_headers (Dict[str, str]): Optional additional HTTP headers for all scraping requests.
+
+    Returns:
+        JSON string with:
+            - results (list): Per-URL result objects, each containing:
+                - success (bool): Whether this URL was scraped and extracted successfully
+                - url (str): The URL
+                - extracted_info (str): Extracted information (empty string on failure)
+                - error (str): Error message if the URL failed
+                - scrape_stats (Dict): Scraping statistics
+                - model_used (str): Summarization model name
+                - tokens_used (int): LLM tokens consumed
+            - summary (Dict):
+                - total (int): Total number of URLs attempted
+                - succeeded (int): Number of successful extractions
+                - failed (int): Number of failed extractions
+                - succeeded_urls (list): URLs that succeeded
+                - failed_urls (list): URLs that failed
+    """
+    logger.info(f'#z 进入scrape_and_extract_info_multi urls={urls}, info_to_extract={info_to_extract}')
+
+    if not urls:
         return json.dumps(
             {
-                "success": False,
-                "url": url,
-                "extracted_info": "",
-                "error": "You are trying to scrape a Hugging Face dataset for answers, please do not use the scrape tool for this purpose.",
-                "scrape_stats": {},
-                "tokens_used": 0,
+                "results": [],
+                "summary": {
+                    "total": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "succeeded_urls": [],
+                    "failed_urls": [],
+                },
             },
             ensure_ascii=False,
         )
 
-    # First, scrape the content with Jina
-    scrape_result = await scrape_url_with_jina(url, custom_headers)
+    # Launch all URL scraping tasks concurrently
+    tasks = [
+        _scrape_and_extract_single(url, info_to_extract, custom_headers)
+        for url in urls
+    ]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # If Jina fails, try direct Python scraping as fallback
-    if not scrape_result["success"]:
-        logger.warning(
-            f"Jina Scrape and Extract Info: Jina scraping failed: {scrape_result['error']}, trying direct Python scraping as fallback"
-        )
-        scrape_result = await scrape_url_with_python(url, custom_headers)
+    results = []
+    succeeded_urls = []
+    failed_urls = []
 
-        if not scrape_result["success"]:
-            logger.error(
-                f"Jina Scrape and Extract Info: Both Jina and Python scraping failed: {scrape_result['error']}"
-            )
-            return json.dumps(
-                {
-                    "success": False,
-                    "url": url,
-                    "extracted_info": "",
-                    "error": f"Scraping failed (both Jina and Python): {scrape_result['error']}",
-                    "scrape_stats": {},
-                    "tokens_used": 0,
-                },
-                ensure_ascii=False,
-            )
+    for url, raw in zip(urls, raw_results):
+        if isinstance(raw, Exception):
+            # Unexpected exception from gather — treat as failure
+            logger.error(f'#z scrape_and_extract_info_multi: exception for url={url}: {raw}')
+            result = {
+                "success": False,
+                "url": url,
+                "extracted_info": "",
+                "error": f"Unexpected error: {str(raw)}",
+                "scrape_stats": {},
+                "model_used": SUMMARY_LLM_MODEL_NAME,
+                "tokens_used": 0,
+            }
         else:
-            logger.info(
-                f"Jina Scrape and Extract Info: Python fallback scraping succeeded for URL: {url}"
-            )
+            result = raw
 
-    # Then, summarize the content
-    extracted_result = await extract_info_with_llm(
-        url=url,
-        content=scrape_result["content"],
-        info_to_extract=info_to_extract,
-        model=SUMMARY_LLM_MODEL_NAME,
-        max_tokens=8192,
-    )
+        results.append(result)
+        if result.get("success"):
+            succeeded_urls.append(url)
+        else:
+            failed_urls.append(url)
 
-    # Combine results
     return json.dumps(
         {
-            "success": extracted_result["success"],
-            "url": url,
-            "extracted_info": extracted_result["extracted_info"],
-            "error": extracted_result["error"],
-            "scrape_stats": {
-                "line_count": scrape_result["line_count"],
-                "char_count": scrape_result["char_count"],
-                "last_char_line": scrape_result["last_char_line"],
-                "all_content_displayed": scrape_result["all_content_displayed"],
+            "results": results,
+            "summary": {
+                "total": len(urls),
+                "succeeded": len(succeeded_urls),
+                "failed": len(failed_urls),
+                "succeeded_urls": succeeded_urls,
+                "failed_urls": failed_urls,
             },
-            "model_used": extracted_result["model_used"],
-            "tokens_used": extracted_result["tokens_used"],
         },
         ensure_ascii=False,
     )
