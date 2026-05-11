@@ -30,6 +30,7 @@ class SummaryGenerator(BaseIOProcessor):
     """Summary generator with improved fallback handling."""
 
     USE_PROPAGATE_MODULE_CONFIGS = ("llm", "prompt")
+    _FINDING_SOURCE_ROLES = frozenset({"user", "tool"})
 
     @staticmethod
     def _iter_text_payloads(content) -> Iterable[str]:
@@ -90,10 +91,12 @@ class SummaryGenerator(BaseIOProcessor):
 
     @staticmethod
     def extract_snippets_from_message_history(message_history: list) -> list[dict[str, str]]:
-        """Extract snippet-like findings from all message payloads in history."""
+        """Extract snippet-like findings from tool-carrying message roles in history."""
         findings: list[dict[str, str]] = []
 
         for msg in message_history:
+            if msg.get("role") not in SummaryGenerator._FINDING_SOURCE_ROLES:
+                continue
             for payload in SummaryGenerator._iter_text_payloads(msg.get("content", "")):
                 findings.extend(SummaryGenerator._extract_findings_from_payload(payload))
 
