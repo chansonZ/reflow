@@ -374,9 +374,23 @@ export default function App() {
                 <>
                   {/* {messages.filter(msg => msg.role !== 'user').map((msg, index) => (
                      */}
-                   {messages.map((msg, index) => (
+                  {messages.filter(msg => msg.role === 'assistant').map((msg, index) => (
                     <MessageBubble key={index} role={msg.role} content={msg.content} isRunning={true} />
                   ))}
+                  {statusUpdate?.trajectory && statusUpdate.trajectory.length > 0 && (() => {
+                    const hasAssistantMsgs = messages.filter(msg => msg.role === 'assistant').length > 0;
+                    // When assistant messages are displayed, their thinking is already shown via MessageBubble.
+                    // Filter out reasoning events to avoid duplication; keep search/read events which are unique.
+                    const visibleEvents = hasAssistantMsgs
+                      ? statusUpdate.trajectory.filter(evt => evt.type !== 'reasoning')
+                      : statusUpdate.trajectory;
+                    return visibleEvents.length > 0 ? (
+                      <div className="space-y-2">
+                        <div className="text-xs text-gray-500">Event stream (live)</div>
+                        <TrajectoryView events={visibleEvents} />
+                      </div>
+                    ) : null;
+                  })()}
                   <div className="flex items-start gap-4">
                     <div className="w-8 h-8 rounded-full bg-blue-500 flex items-center justify-center flex-shrink-0">
                       <Bot className="w-5 h-5 text-white" />
@@ -834,9 +848,37 @@ function TrajectoryView({ events }: { events: TrajectoryEvent[] }) {
 
     // tool_call fallback
     return (
-      <div key={evt.id} className="flex items-start gap-2">
-        <Wrench className="w-4 h-4 text-gray-500 mt-0.5 flex-shrink-0" />
-        <span className="text-sm text-gray-600">{evt.tool_name || 'Tool call'}</span>
+      <div key={evt.id} className="space-y-1.5">
+        <div className="flex items-start gap-2">
+          <Wrench className="w-4 h-4 text-gray-500 mt-0.5 flex-shrink-0" />
+          <span className="text-sm text-gray-600">{evt.tool_name || 'Tool call'}</span>
+          {evt.status && (
+            <span className={`text-xs px-2 py-0.5 rounded-full ${
+              evt.status === 'error'
+                ? 'bg-red-100 text-red-700'
+                : evt.status === 'completed'
+                  ? 'bg-green-100 text-green-700'
+                  : 'bg-gray-100 text-gray-600'
+            }`}>
+              {evt.status}
+            </span>
+          )}
+        </div>
+        {evt.args && (
+          <pre className="ml-6 text-xs text-gray-500 whitespace-pre-wrap break-all">
+            {JSON.stringify(evt.args, null, 2)}
+          </pre>
+        )}
+        {evt.error && (
+          <pre className="ml-6 text-xs text-red-600 whitespace-pre-wrap break-all">
+            {evt.error}
+          </pre>
+        )}
+        {!evt.error && evt.result && (
+          <pre className="ml-6 text-xs text-gray-500 whitespace-pre-wrap break-all line-clamp-4">
+            {evt.result}
+          </pre>
+        )}
       </div>
     );
   };

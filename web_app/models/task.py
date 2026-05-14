@@ -43,6 +43,9 @@ class TrajectoryEvent(BaseModel):
     # generic tool_call fallback
     tool_name: str | None = None
     args: dict[str, Any] | None = None
+    status: Literal["started", "completed", "error"] | None = None
+    result: str | None = None
+    error: str | None = None
 
 class FileInfo(BaseModel):
     """File information for uploaded files."""
